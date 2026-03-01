@@ -1,4 +1,4 @@
-use super::{DbEngine, DbSession, RowStream};
+use super::{ColumnKind, ColumnSchema, DbEngine, DbSession, RowStream};
 use crate::engine::dialect::{format_qualified_table, split_table_name, SqlDialect};
 use crate::engine::value::SqlValue;
 use crate::util::dialects::postgres::POSTGRES_DIALECT;
@@ -73,6 +73,41 @@ impl DbSession for PostgresSession {
         }
 
         Ok(tables)
+    }
+
+    async fn describe_table_columns(&mut self, table: &str) -> Result<Vec<ColumnSchema>> {
+        let (schema, name) = parse_table_name(table)?;
+        let rows = sqlx::query(
+            "SELECT column_name, data_type, udt_name, is_nullable
+             FROM information_schema.columns
+             WHERE table_schema = $1 AND table_name = $2
+             ORDER BY ordinal_position",
+        )
+        .bind(&schema)
+        .bind(&name)
+        .fetch_all(&mut self.conn)
+        .await
+        .with_context(|| format!("Failed to describe table '{}'", table))?;
+
+        let mut columns = Vec::with_capacity(rows.len());
+        for row in rows {
+            let column_name: String = row.get("column_name");
+            let data_type: String = row.get("data_type");
+            let udt_name: String = row.get("udt_name");
+            let is_nullable: String = row.get("is_nullable");
+            let normalized = map_postgres_type_to_kind(&data_type)
+                .or_else(|| map_postgres_type_to_kind(&udt_name))
+                .unwrap_or(ColumnKind::String);
+
+            columns.push(ColumnSchema {
+                name: column_name,
+                kind: normalized,
+                nullable: is_nullable.eq_ignore_ascii_case("YES"),
+                db_type_name: data_type,
+            });
+        }
+
+        Ok(columns)
     }
 
     async fn show_create_table(&mut self, table: &str) -> Result<String> {
@@ -467,5 +502,66 @@ fn table_matches(pattern: &str, qualified: &str) -> bool {
     } else {
         let (_, table_name) = split_table_name(qualified);
         pattern.eq_ignore_ascii_case(table_name)
+    }
+}
+
+fn map_postgres_type_to_kind(type_name: &str) -> Option<ColumnKind> {
+    let normalized = type_name.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "smallint" | "integer" | "bigint" | "int2" | "int4" | "int8" => Some(ColumnKind::Int),
+        "real" | "double precision" | "numeric" | "decimal" | "float4" | "float8" => {
+            Some(ColumnKind::Float)
+        }
+        "boolean" | "bool" => Some(ColumnKind::Bool),
+        "date" => Some(ColumnKind::Date),
+        "timestamp without time zone"
+        | "timestamp with time zone"
+        | "timestamp"
+        | "timestamptz"
+        | "timestampz" => Some(ColumnKind::Timestamp),
+        "character varying" | "varchar" | "character" | "char" | "text" | "name" | "json"
+        | "jsonb" | "uuid" => Some(ColumnKind::String),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_postgres_type_names() {
+        assert_eq!(
+            map_postgres_type_to_kind("integer"),
+            Some(crate::engine::ColumnKind::Int)
+        );
+        assert_eq!(
+            map_postgres_type_to_kind("bigint"),
+            Some(crate::engine::ColumnKind::Int)
+        );
+        assert_eq!(
+            map_postgres_type_to_kind("numeric"),
+            Some(crate::engine::ColumnKind::Float)
+        );
+        assert_eq!(
+            map_postgres_type_to_kind("double precision"),
+            Some(crate::engine::ColumnKind::Float)
+        );
+        assert_eq!(
+            map_postgres_type_to_kind("boolean"),
+            Some(crate::engine::ColumnKind::Bool)
+        );
+        assert_eq!(
+            map_postgres_type_to_kind("date"),
+            Some(crate::engine::ColumnKind::Date)
+        );
+        assert_eq!(
+            map_postgres_type_to_kind("timestamp with time zone"),
+            Some(crate::engine::ColumnKind::Timestamp)
+        );
+        assert_eq!(
+            map_postgres_type_to_kind("text"),
+            Some(crate::engine::ColumnKind::String)
+        );
     }
 }

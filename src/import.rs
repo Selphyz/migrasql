@@ -1,5 +1,5 @@
 use crate::engine::value::SqlValue;
-use crate::engine::{DbEngine, DbSession};
+use crate::engine::{ColumnKind, ColumnSchema, DbEngine, DbSession};
 use anyhow::{bail, Context, Result};
 use chrono::Datelike;
 use csv::ReaderBuilder;
@@ -131,13 +131,6 @@ pub async fn import(
         })
         .collect();
 
-    // Infer column types from first 100 rows
-    println!("Inferring column types...");
-    let file = File::open(&options.input).context("Failed to open input file")?;
-    let mut csv_reader = ReaderBuilder::new().from_reader(file);
-
-    let inferred_types = infer_column_types(&mut csv_reader, &csv_columns, 100)?;
-
     // Check if table exists
     let tables = session
         .list_tables(&[options.table.clone()], &[])
@@ -145,19 +138,37 @@ pub async fn import(
         .context("Failed to list tables")?;
 
     let table_exists = !tables.is_empty();
+    let expected_columns: Vec<ColumnSchema>;
 
     // Create table if it doesn't exist
     if !table_exists {
+        // Infer column types from CSV sample for table bootstrap
+        println!("Inferring column types...");
+        let file = File::open(&options.input).context("Failed to open input file")?;
+        let mut csv_reader = ReaderBuilder::new().from_reader(file);
+        let inferred_types = infer_column_types(&mut csv_reader, &csv_columns, 100)?;
+
         println!("Creating table '{}'...", options.table);
         session
             .create_table_from_columns(&options.table, &db_columns, &inferred_types)
             .await
             .context("Failed to create table")?;
+        expected_columns = inferred_types_to_schema(&db_columns, &inferred_types);
     } else {
         println!(
             "Table '{}' already exists, inserting data...",
             options.table
         );
+        let table_schema = session
+            .describe_table_columns(&options.table)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to inspect destination schema for '{}'",
+                    options.table
+                )
+            })?;
+        expected_columns = resolve_expected_columns_from_schema(&db_columns, &table_schema)?;
     }
 
     // Disable constraints if requested
@@ -200,7 +211,7 @@ pub async fn import(
         }
 
         match result {
-            Ok(row) => match parse_row(&row, &csv_columns, &db_columns, &inferred_types) {
+            Ok(row) => match parse_row_with_schema(&row, &expected_columns, row_number) {
                 Ok(values) => {
                     batch.push((row_number, values));
 
@@ -705,130 +716,323 @@ fn detect_value_type(value: &str) -> String {
     "string".to_string()
 }
 
-/// Parse a CSV row into SqlValues
-fn parse_row(
-    row: &[String],
-    _csv_columns: &[String],
+fn inferred_types_to_schema(
     db_columns: &[String],
-    types: &[SqlValue],
+    inferred_types: &[SqlValue],
+) -> Vec<ColumnSchema> {
+    db_columns
+        .iter()
+        .zip(inferred_types.iter())
+        .map(|(name, inferred)| ColumnSchema {
+            name: name.clone(),
+            kind: sql_value_to_column_kind(inferred),
+            nullable: true,
+            db_type_name: format!("inferred:{:?}", sql_value_to_column_kind(inferred)),
+        })
+        .collect()
+}
+
+fn sql_value_to_column_kind(value: &SqlValue) -> ColumnKind {
+    match value {
+        SqlValue::Int(_) => ColumnKind::Int,
+        SqlValue::Float(_) | SqlValue::Decimal(_) => ColumnKind::Float,
+        SqlValue::Bool(_) => ColumnKind::Bool,
+        SqlValue::Date { .. } => ColumnKind::Date,
+        SqlValue::Timestamp { .. } => ColumnKind::Timestamp,
+        _ => ColumnKind::String,
+    }
+}
+
+fn resolve_expected_columns_from_schema(
+    db_columns: &[String],
+    table_schema: &[ColumnSchema],
+) -> Result<Vec<ColumnSchema>> {
+    let mut by_name: HashMap<String, &ColumnSchema> = HashMap::with_capacity(table_schema.len());
+    for col in table_schema {
+        by_name.insert(col.name.to_ascii_lowercase(), col);
+    }
+
+    let mut resolved = Vec::with_capacity(db_columns.len());
+    for db_col in db_columns {
+        let key = db_col.to_ascii_lowercase();
+        let schema_col = by_name.get(&key).copied().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Column mapping points to destination column '{}' but it does not exist in destination table schema",
+                db_col
+            )
+        })?;
+        resolved.push(schema_col.clone());
+    }
+
+    Ok(resolved)
+}
+
+fn parse_row_with_schema(
+    row: &[String],
+    schema: &[ColumnSchema],
+    row_number: usize,
 ) -> Result<Vec<SqlValue>> {
     use chrono::NaiveDate;
 
-    let mut values = Vec::new();
+    let mut values = Vec::with_capacity(schema.len());
+    let row_preview = summarize_csv_record(row);
 
-    for (col_idx, db_col) in db_columns.iter().enumerate() {
-        let value = if col_idx < row.len() {
-            row[col_idx].trim()
-        } else {
-            ""
-        };
+    for (col_idx, col_schema) in schema.iter().enumerate() {
+        let raw_value = row.get(col_idx).map(|v| v.trim()).unwrap_or("");
 
-        let sql_value = if value.is_empty()
-            || value.eq_ignore_ascii_case("null")
-            || value.eq_ignore_ascii_case("none")
+        if raw_value.is_empty()
+            || raw_value.eq_ignore_ascii_case("null")
+            || raw_value.eq_ignore_ascii_case("none")
         {
-            SqlValue::Null
-        } else {
-            match &types[col_idx] {
-                SqlValue::Int(_) => {
-                    let int_val = value.parse::<i64>().context(format!(
-                        "Failed to parse '{}' as integer for column '{}'",
-                        value, db_col
-                    ))?;
-                    SqlValue::Int(int_val)
-                }
-                SqlValue::Float(_) => {
-                    let float_val = value.parse::<f64>().context(format!(
-                        "Failed to parse '{}' as float for column '{}'",
-                        value, db_col
-                    ))?;
-                    SqlValue::Float(float_val)
-                }
-                SqlValue::Bool(_) => {
-                    let bool_val = match value.to_lowercase().as_str() {
-                        "true" | "yes" | "1" => true,
-                        "false" | "no" | "0" => false,
-                        _ => bail!(
-                            "Failed to parse '{}' as boolean for column '{}'",
-                            value,
-                            db_col
-                        ),
-                    };
-                    SqlValue::Bool(bool_val)
-                }
-                SqlValue::Date { .. } => {
-                    let date = NaiveDate::parse_from_str(value, "%Y-%m-%d").context(format!(
-                        "Failed to parse '{}' as date (YYYY-MM-DD) for column '{}'",
-                        value, db_col
-                    ))?;
-                    SqlValue::Date {
-                        y: date.year(),
-                        m: date.month(),
-                        d: date.day(),
-                    }
-                }
-                SqlValue::Timestamp { .. } => {
-                    let parts: Vec<&str> = value.split(' ').collect();
-                    if parts.len() < 2 {
-                        bail!(
-                            "Failed to parse '{}' as timestamp for column '{}': invalid format",
-                            value,
-                            db_col
-                        );
-                    }
-
-                    let date_parts: Vec<&str> = parts[0].split('-').collect();
-                    let time_parts: Vec<&str> = parts[1].split(':').collect();
-
-                    if date_parts.len() != 3 || time_parts.len() < 2 {
-                        bail!(
-                            "Failed to parse '{}' as timestamp for column '{}'",
-                            value,
-                            db_col
-                        );
-                    }
-
-                    let y = date_parts[0]
-                        .parse::<i32>()
-                        .context("Invalid year in timestamp")?;
-                    let m = date_parts[1]
-                        .parse::<u32>()
-                        .context("Invalid month in timestamp")?;
-                    let d = date_parts[2]
-                        .parse::<u32>()
-                        .context("Invalid day in timestamp")?;
-                    let hh = time_parts[0]
-                        .parse::<u32>()
-                        .context("Invalid hour in timestamp")?;
-                    let mm = time_parts[1]
-                        .parse::<u32>()
-                        .context("Invalid minute in timestamp")?;
-                    let ss = if time_parts.len() > 2 {
-                        time_parts[2]
-                            .parse::<u32>()
-                            .context("Invalid second in timestamp")?
-                    } else {
-                        0
-                    };
-
-                    SqlValue::Timestamp {
-                        y,
-                        m,
-                        d,
-                        hh,
-                        mm,
-                        ss,
-                        us: 0,
-                    }
-                }
-                _ => SqlValue::String(value.to_string()),
+            if !col_schema.nullable {
+                bail!(
+                    "{}",
+                    format_schema_mismatch_error(
+                        row_number,
+                        &col_schema.name,
+                        &col_schema.db_type_name,
+                        raw_value,
+                        &row_preview,
+                        "empty/null value is not allowed for non-nullable column"
+                    )
+                );
             }
+            values.push(SqlValue::Null);
+            continue;
+        }
+
+        let parsed = match col_schema.kind {
+            ColumnKind::Int => raw_value.parse::<i64>().map(SqlValue::Int).map_err(|e| {
+                anyhow::anyhow!(
+                    "{}",
+                    format_schema_mismatch_error(
+                        row_number,
+                        &col_schema.name,
+                        &col_schema.db_type_name,
+                        raw_value,
+                        &row_preview,
+                        &e.to_string()
+                    )
+                )
+            })?,
+            ColumnKind::Float => raw_value.parse::<f64>().map(SqlValue::Float).map_err(|e| {
+                anyhow::anyhow!(
+                    "{}",
+                    format_schema_mismatch_error(
+                        row_number,
+                        &col_schema.name,
+                        &col_schema.db_type_name,
+                        raw_value,
+                        &row_preview,
+                        &e.to_string()
+                    )
+                )
+            })?,
+            ColumnKind::Bool => match raw_value.to_ascii_lowercase().as_str() {
+                "true" | "yes" | "1" => SqlValue::Bool(true),
+                "false" | "no" | "0" => SqlValue::Bool(false),
+                _ => bail!(
+                    "{}",
+                    format_schema_mismatch_error(
+                        row_number,
+                        &col_schema.name,
+                        &col_schema.db_type_name,
+                        raw_value,
+                        &row_preview,
+                        "invalid boolean value"
+                    )
+                ),
+            },
+            ColumnKind::Date => {
+                let date = NaiveDate::parse_from_str(raw_value, "%Y-%m-%d").map_err(|e| {
+                    anyhow::anyhow!(
+                        "{}",
+                        format_schema_mismatch_error(
+                            row_number,
+                            &col_schema.name,
+                            &col_schema.db_type_name,
+                            raw_value,
+                            &row_preview,
+                            &e.to_string()
+                        )
+                    )
+                })?;
+                SqlValue::Date {
+                    y: date.year(),
+                    m: date.month(),
+                    d: date.day(),
+                }
+            }
+            ColumnKind::Timestamp => parse_timestamp_value(
+                raw_value,
+                row_number,
+                &col_schema.name,
+                &col_schema.db_type_name,
+                &row_preview,
+            )?,
+            ColumnKind::String => SqlValue::String(raw_value.to_string()),
         };
 
-        values.push(sql_value);
+        values.push(parsed);
     }
 
     Ok(values)
+}
+
+fn parse_timestamp_value(
+    raw_value: &str,
+    row_number: usize,
+    column_name: &str,
+    db_type_name: &str,
+    row_preview: &str,
+) -> Result<SqlValue> {
+    let parts: Vec<&str> = raw_value.split(' ').collect();
+    if parts.len() < 2 {
+        bail!(
+            "{}",
+            format_schema_mismatch_error(
+                row_number,
+                column_name,
+                db_type_name,
+                raw_value,
+                row_preview,
+                "invalid timestamp format; expected YYYY-MM-DD HH:MM[:SS]"
+            )
+        );
+    }
+
+    let date_parts: Vec<&str> = parts[0].split('-').collect();
+    let time_parts: Vec<&str> = parts[1].split(':').collect();
+
+    if date_parts.len() != 3 || time_parts.len() < 2 {
+        bail!(
+            "{}",
+            format_schema_mismatch_error(
+                row_number,
+                column_name,
+                db_type_name,
+                raw_value,
+                row_preview,
+                "invalid timestamp components"
+            )
+        );
+    }
+
+    let y = date_parts[0].parse::<i32>().map_err(|e| {
+        anyhow::anyhow!(
+            "{}",
+            format_schema_mismatch_error(
+                row_number,
+                column_name,
+                db_type_name,
+                raw_value,
+                row_preview,
+                &format!("invalid year: {}", e)
+            )
+        )
+    })?;
+    let m = date_parts[1].parse::<u32>().map_err(|e| {
+        anyhow::anyhow!(
+            "{}",
+            format_schema_mismatch_error(
+                row_number,
+                column_name,
+                db_type_name,
+                raw_value,
+                row_preview,
+                &format!("invalid month: {}", e)
+            )
+        )
+    })?;
+    let d = date_parts[2].parse::<u32>().map_err(|e| {
+        anyhow::anyhow!(
+            "{}",
+            format_schema_mismatch_error(
+                row_number,
+                column_name,
+                db_type_name,
+                raw_value,
+                row_preview,
+                &format!("invalid day: {}", e)
+            )
+        )
+    })?;
+    let hh = time_parts[0].parse::<u32>().map_err(|e| {
+        anyhow::anyhow!(
+            "{}",
+            format_schema_mismatch_error(
+                row_number,
+                column_name,
+                db_type_name,
+                raw_value,
+                row_preview,
+                &format!("invalid hour: {}", e)
+            )
+        )
+    })?;
+    let mm = time_parts[1].parse::<u32>().map_err(|e| {
+        anyhow::anyhow!(
+            "{}",
+            format_schema_mismatch_error(
+                row_number,
+                column_name,
+                db_type_name,
+                raw_value,
+                row_preview,
+                &format!("invalid minute: {}", e)
+            )
+        )
+    })?;
+    let ss = if time_parts.len() > 2 {
+        time_parts[2].parse::<u32>().map_err(|e| {
+            anyhow::anyhow!(
+                "{}",
+                format_schema_mismatch_error(
+                    row_number,
+                    column_name,
+                    db_type_name,
+                    raw_value,
+                    row_preview,
+                    &format!("invalid second: {}", e)
+                )
+            )
+        })?
+    } else {
+        0
+    };
+
+    Ok(SqlValue::Timestamp {
+        y,
+        m,
+        d,
+        hh,
+        mm,
+        ss,
+        us: 0,
+    })
+}
+
+fn summarize_csv_record(row: &[String]) -> String {
+    const MAX_LEN: usize = 200;
+    let value = format!("{:?}", row);
+    match value.char_indices().nth(MAX_LEN) {
+        Some((byte_idx, _)) => format!("{}...", &value[..byte_idx]),
+        None => value,
+    }
+}
+
+fn format_schema_mismatch_error(
+    line_number: usize,
+    column_name: &str,
+    expected_db_type: &str,
+    raw_value: &str,
+    row_preview: &str,
+    reason: &str,
+) -> String {
+    format!(
+        "Schema mismatch at line {}: column '{}' expected {} but got '{}'. Reason: {}. row: {}",
+        line_number, column_name, expected_db_type, raw_value, reason, row_preview
+    )
 }
 
 /// Parse column mapping from string format: "col1:db_col1,col2:db_col2"
@@ -902,5 +1106,70 @@ mod tests {
         tracker.record(15, &[SqlValue::Int(2)]);
         let snapshot = tracker.snapshot().expect("snapshot should exist");
         assert_eq!(snapshot.line_number, 15);
+    }
+
+    #[test]
+    fn schema_types_are_usable() {
+        let col = crate::engine::ColumnSchema {
+            name: "dircomp".to_string(),
+            kind: crate::engine::ColumnKind::String,
+            nullable: true,
+            db_type_name: "varchar".to_string(),
+        };
+        assert_eq!(col.name, "dircomp");
+    }
+
+    #[test]
+    fn table_schema_overrides_inference() {
+        let db_columns = vec!["DIRCOMP".to_string()];
+        let table_schema = vec![crate::engine::ColumnSchema {
+            name: "DIRCOMP".to_string(),
+            kind: crate::engine::ColumnKind::String,
+            nullable: true,
+            db_type_name: "varchar".to_string(),
+        }];
+
+        let resolved = resolve_expected_columns_from_schema(&db_columns, &table_schema).unwrap();
+        assert_eq!(resolved[0].kind, crate::engine::ColumnKind::String);
+    }
+
+    #[test]
+    fn schema_mismatch_error_contains_row_context() {
+        let msg = format_schema_mismatch_error(
+            13,
+            "DIRCOMP",
+            "int",
+            "45 PBJ IZ",
+            r#"[\"45 PBJ IZ\",\"OTRO\"]"#,
+            "invalid digit found in string",
+        );
+
+        assert!(msg.contains("line 13"));
+        assert!(msg.contains("DIRCOMP"));
+        assert!(msg.contains("expected int"));
+        assert!(msg.contains("45 PBJ IZ"));
+        assert!(msg.contains("row:"));
+    }
+
+    #[test]
+    fn mapping_and_nullability_validation() {
+        let db_columns = vec!["DIRCOMP".to_string()];
+        let table_schema = vec![crate::engine::ColumnSchema {
+            name: "OTRA".to_string(),
+            kind: crate::engine::ColumnKind::String,
+            nullable: true,
+            db_type_name: "varchar".to_string(),
+        }];
+        assert!(resolve_expected_columns_from_schema(&db_columns, &table_schema).is_err());
+
+        let required_schema = vec![crate::engine::ColumnSchema {
+            name: "DIRCOMP".to_string(),
+            kind: crate::engine::ColumnKind::String,
+            nullable: false,
+            db_type_name: "varchar".to_string(),
+        }];
+        let err = parse_row_with_schema(&["".to_string()], &required_schema, 7).unwrap_err();
+        assert!(err.to_string().contains("non-nullable"));
+        assert!(err.to_string().contains("DIRCOMP"));
     }
 }

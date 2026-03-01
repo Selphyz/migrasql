@@ -13,6 +13,24 @@ use std::pin::Pin;
 /// Stream of rows from a database query
 pub type RowStream = Pin<Box<dyn Stream<Item = Result<Vec<SqlValue>>> + Send>>;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ColumnKind {
+    Int,
+    Float,
+    Bool,
+    Date,
+    Timestamp,
+    String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColumnSchema {
+    pub name: String,
+    pub kind: ColumnKind,
+    pub nullable: bool,
+    pub db_type_name: String,
+}
+
 /// Database engine trait for provider abstraction
 #[async_trait]
 pub trait DbEngine: Send + Sync {
@@ -70,6 +88,14 @@ pub trait DbSession: Send {
         column_names: &[String],
         column_types: &[SqlValue],
     ) -> Result<()>;
+
+    /// Describe destination table columns and normalized logical types
+    async fn describe_table_columns(&mut self, table: &str) -> Result<Vec<ColumnSchema>> {
+        Err(anyhow::anyhow!(
+            "describe_table_columns is not implemented for table '{}'",
+            table
+        ))
+    }
 }
 
 /// Factory for creating database engines

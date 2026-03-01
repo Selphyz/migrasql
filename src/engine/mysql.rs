@@ -1,4 +1,4 @@
-use super::{DbEngine, DbSession, RowStream};
+use super::{ColumnKind, ColumnSchema, DbEngine, DbSession, RowStream};
 use crate::engine::dialect::SqlDialect;
 use crate::engine::value::SqlValue;
 use crate::util::dialects::mysql::MYSQL_DIALECT;
@@ -63,6 +63,39 @@ impl DbSession for MysqlSession {
         }
 
         Ok(tables)
+    }
+
+    async fn describe_table_columns(&mut self, table: &str) -> Result<Vec<ColumnSchema>> {
+        let query = format!(
+            "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, IS_NULLABLE \
+             FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '{}' \
+             ORDER BY ORDINAL_POSITION",
+            table.replace('\'', "''")
+        );
+        let rows = sqlx::query(&query)
+            .fetch_all(&mut self.conn)
+            .await
+            .with_context(|| format!("Failed to describe table '{}'", table))?;
+
+        let mut columns = Vec::with_capacity(rows.len());
+        for row in rows {
+            let name: String = row.get(0);
+            let data_type: String = row.get(1);
+            let column_type: String = row.get(2);
+            let is_nullable: String = row.get(3);
+            let kind =
+                map_mysql_type_to_kind(&column_type).or_else(|| map_mysql_type_to_kind(&data_type));
+
+            columns.push(ColumnSchema {
+                name,
+                kind: kind.unwrap_or(ColumnKind::String),
+                nullable: is_nullable.eq_ignore_ascii_case("YES"),
+                db_type_name: column_type,
+            });
+        }
+
+        Ok(columns)
     }
 
     async fn show_create_table(&mut self, table: &str) -> Result<String> {
@@ -305,6 +338,28 @@ fn minify_create_table(create_stmt: &str) -> String {
     }
 }
 
+fn map_mysql_type_to_kind(type_name: &str) -> Option<ColumnKind> {
+    let raw = type_name.trim().to_ascii_lowercase();
+    let base = raw.split('(').next().unwrap_or(raw.as_str());
+
+    if raw == "tinyint(1)" {
+        return Some(ColumnKind::Bool);
+    }
+
+    match base {
+        "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint" => {
+            Some(ColumnKind::Int)
+        }
+        "decimal" | "numeric" | "float" | "double" | "real" => Some(ColumnKind::Float),
+        "bool" | "boolean" | "bit" => Some(ColumnKind::Bool),
+        "date" => Some(ColumnKind::Date),
+        "datetime" | "timestamp" => Some(ColumnKind::Timestamp),
+        "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" | "enum" | "set"
+        | "json" => Some(ColumnKind::String),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,5 +375,41 @@ mod tests {
         let output = minify_create_table(input);
         assert!(output.contains("CREATE TABLE IF NOT EXISTS"));
         assert!(!output.contains('\n'));
+    }
+
+    #[test]
+    fn maps_mysql_type_names() {
+        assert_eq!(
+            map_mysql_type_to_kind("int"),
+            Some(crate::engine::ColumnKind::Int)
+        );
+        assert_eq!(
+            map_mysql_type_to_kind("bigint"),
+            Some(crate::engine::ColumnKind::Int)
+        );
+        assert_eq!(
+            map_mysql_type_to_kind("decimal"),
+            Some(crate::engine::ColumnKind::Float)
+        );
+        assert_eq!(
+            map_mysql_type_to_kind("float"),
+            Some(crate::engine::ColumnKind::Float)
+        );
+        assert_eq!(
+            map_mysql_type_to_kind("tinyint(1)"),
+            Some(crate::engine::ColumnKind::Bool)
+        );
+        assert_eq!(
+            map_mysql_type_to_kind("date"),
+            Some(crate::engine::ColumnKind::Date)
+        );
+        assert_eq!(
+            map_mysql_type_to_kind("datetime"),
+            Some(crate::engine::ColumnKind::Timestamp)
+        );
+        assert_eq!(
+            map_mysql_type_to_kind("varchar"),
+            Some(crate::engine::ColumnKind::String)
+        );
     }
 }
