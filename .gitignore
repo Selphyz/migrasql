@@ -1,0 +1,7 @@
+/target
+Cargo.lock
+*.sql
+*.sql.gz
+.env
+.agents
+.claude
